@@ -303,13 +303,13 @@ def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack):
 	print("Rebuilding as a single APK.") #HERE
 	if os.path.exists(os.path.join(baseapkdir, "res", "navigation")) == True:
 		print("[+] Found res/navigation directory, rebuilding with 'apktool --use-aapt2'.")
-		ret = runApkTool(["--use-aapt2", "b", baseapkdir])
+		ret = runApkTool(["b", "--use-aapt2", baseapkdir])
 		if ret.returncode != 0:
 			print("Error: Failed to run 'apktool b " + baseapkdir + "'.\nRun with --debug-output for more information.")
 			sys.exit(1)
 	elif getApktoolVersion() > pkg_resources.parse_version("2.4.2"):
 		print("[+] Found apktool version > 2.4.2, rebuilding with 'apktool --use-aapt2'.")
-		ret = runApkTool(["--use-aapt2", "b", baseapkdir])
+		ret = runApkTool(["b", "--use-aapt2", baseapkdir])
 		if ret.returncode != 0:
 			print("Error: Failed to run 'apktool b " + baseapkdir + "'.\nRun with --debug-output for more information.")
 			sys.exit(1)
