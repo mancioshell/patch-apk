@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 import argparse
 import os
-import pkg_resources
+from packaging.version import parse as parse_version
 import shutil
 import subprocess
 import sys
@@ -170,7 +170,7 @@ def getStdout():
 ####################
 def getApktoolVersion():
     proc = subprocess.run(["apktool", "-version"], stdout=subprocess.PIPE)
-    return pkg_resources.parse_version(proc.stdout.decode("utf-8").strip().split("-")[0].strip())
+    return parse_version(proc.stdout.decode("utf-8").strip().split("-")[0].strip())
 
 ####################
 # Wrapper to run apktool platform-independently, complete with a dirty hack to fix apktool's dirty hack.
@@ -210,7 +210,7 @@ def build(baseapkdir):
     # Fix private resources preventing builds (apktool wontfix: https://github.com/iBotPeaches/Apktool/issues/2761)
     fixPrivateResources(baseapkdir)
 
-    if os.path.exists(os.path.join(baseapkdir, "res", "navigation")) or getApktoolVersion() > pkg_resources.parse_version("2.4.2"):
+    if os.path.exists(os.path.join(baseapkdir, "res", "navigation")) or getApktoolVersion() > parse_version("2.4.2"):
         verbosePrint("[+] Rebuilding with 'apktool --use-aapt2'.")
         ret = runApkTool(["--use-aapt2", "b", baseapkdir])
         if ret.returncode != 0:
