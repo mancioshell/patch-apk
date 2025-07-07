@@ -219,16 +219,10 @@ def build(baseapkdir):
     # Fix private resources preventing builds (apktool wontfix: https://github.com/iBotPeaches/Apktool/issues/2761)
     fixPrivateResources(baseapkdir)
 
-    if os.path.exists(os.path.join(baseapkdir, "res", "navigation")) or getApktoolVersion() > parse_version("2.4.2"):
-        verbosePrint("[+] Rebuilding with 'apktool --use-aapt2'.")
-        ret = runApkTool(["--use-aapt2", "b", baseapkdir])
-        if ret.returncode != 0:
-            abort("Error: Failed to run 'apktool b " + baseapkdir + "'.\nRun with --debug-output for more information.")
-    else:
-        verbosePrint("[+] Rebuilding APK with apktool.")
-        ret = runApkTool(["b", baseapkdir])
-        if ret.returncode != 0:
-            abort("Error: Failed to run 'apktool b " + baseapkdir + "'.\nRun with --debug-output for more information.")
+    verbosePrint("[+] Rebuilding APK with apktool.")
+    ret = runApkTool(["b", baseapkdir])
+    if ret.returncode != 0:
+        abort("Error: Failed to run 'apktool b " + baseapkdir + "'.\nRun with --debug-output for more information.")
 
 ####################
 # Sign the APK with apksigner and zip align
