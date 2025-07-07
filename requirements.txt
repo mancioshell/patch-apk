@@ -1,3 +1,4 @@
 progress
 termcolor
 objection==1.11.0
+packaging
