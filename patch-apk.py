@@ -169,8 +169,17 @@ def getStdout():
 # Get apktool version
 ####################
 def getApktoolVersion():
-    proc = subprocess.run(["apktool", "-version"], stdout=subprocess.PIPE)
-    return parse_version(proc.stdout.decode("utf-8").strip().split("-")[0].strip())
+    commands = [["apktool", "version"], ["apktool", "-version"]]
+    
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+            output = proc.stdout.decode("utf-8").strip()
+            version_str = output.split("-")[0].strip()
+            return parse_version(version_str)
+        except (Exception):
+            continue
+    raise Exception("Error: Failed to get apktool version.")
 
 ####################
 # Wrapper to run apktool platform-independently, complete with a dirty hack to fix apktool's dirty hack.
