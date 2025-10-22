@@ -41,45 +41,114 @@ def main():
         # Save the APK if requested
         if args.save_apk is not None or args.extract_only:
             targetName = args.save_apk if args.save_apk is not None else pkgname + ".apk"
-            print("\n[+] Saving a copy of the APK to " + targetName)
+            print("[+] Saving a copy of the APK to " + targetName)
             shutil.copy(apkfile, targetName)
 
             if args.extract_only:
                 os.remove(apkfile)
                 return
+
+        # Before patching with objection, add INTERNET permission if not already present, and set extractNativeLibs to true
+        fixAPKBeforeObjection(apkfile, not args.no_enable_user_certs)
         
         # Patch the target APK with objection
-        print("\n[+] Patching " + apkfile.split(os.sep)[-1] + " with objection.")
-        if subprocess.run(["objection", "patchapk", "--skip-resources", "--ignore-nativelibs", "-s", apkfile], stdout=getStdout(), stderr=getStdout()).returncode != 0:
-            print("\n[+] Objection patching failed, trying alternative approach")
+        print("[+] Patching " + apkfile.split(os.sep)[-1] + " with objection.")
+        warningPrint("[!] The application will be patched with Frida 16.7.19. See https://github.com/sensepost/objection/issues/737 for more information.")
+        if subprocess.run(["objection", "patchapk", "-V", "16.7.19", "--skip-resources", "--ignore-nativelibs", "-s", apkfile], capture_output=True).returncode != 0:
+            print("[+] Objection patching failed, trying alternative approach")
             warningPrint("[!] If you get an error, the application might not have a launchable activity")
             
             # Try without --skip-resources, since objection potentially wasn't able to identify the starting activity
             # There could have been another reason for the failure, but it's a sensible fallback
-            assertSubprocessSuccessfulRun(["objection", "patchapk", "--ignore-nativelibs", "-s", apkfile])
+            # Another reason could be a missing INTERNET permission
+            assertSubprocessSuccessfulRun(["objection", "patchapk","-V", "16.7.19",  "--ignore-nativelibs", "-s", apkfile])
     
         os.remove(apkfile)
         shutil.move(apkfile[:-4] + ".objection.apk", apkfile)
         
-        # Enable support for user-installed CA certs (e.g. Burp Suite CA installed on device by user)
-        if not args.no_enable_user_certs:
-            enableUserCerts(apkfile)
-        
         # Uninstall the original package from the device
-        print(f"\n[+] Uninstalling the original package from the device. (user: {current_user})")
+        print(f"[+] Uninstalling the original package from the device. (user: {current_user})")
         assertSubprocessSuccessfulRun(["adb", "uninstall", "--user", current_user, pkgname])
         
         # Install the patched APK
-        print(f"\n[+] Installing the patched APK to the device. (user: {current_user})")
+        print(f"[+] Installing the patched APK to the device. (user: {current_user})")
         assertSubprocessSuccessfulRun(["adb", "install", "--user", current_user, apkfile])
+
         
         # Done
-        print("\n[+] Done")
+        print("[+] Done")
 
 def assertSubprocessSuccessfulRun(args):
     if subprocess.run(args, stdout=getStdout(), stderr=getStdout()).returncode != 0:
         abort(f"Error: Failed to run {' '.join(args)}.\nRun with --debug-output for more information.")
+
+
+def fixAPKBeforeObjection(apkfile, fix_network_security_config):
+    print("[+] Prepping AndroidManifest.xml")
+    with tempfile.TemporaryDirectory() as tmppath:
+        apkdir = os.path.join(tmppath, "apk")
+        ret = runApkTool(["d", apkfile, "-o", apkdir])
+        if ret["returncode"] != 0:
+            abort("Error: Failed to run 'apktool d " + apkfile + " -o " + apkdir + "'.\nRun with --debug-output for more information.")
         
+        # Load AndroidManifest.xml
+        manifestPath = os.path.join(apkdir, "AndroidManifest.xml")
+        tree = xml.etree.ElementTree.parse(manifestPath)
+        
+        # Register the namespaces and get the prefix for the "android" namespace
+        namespaces = dict([node for _,node in xml.etree.ElementTree.iterparse(manifestPath, events=["start-ns"])])
+        for ns in namespaces:
+            xml.etree.ElementTree.register_namespace(ns, namespaces[ns])
+        ns = "{" + namespaces["android"] + "}"
+        
+        # Ensure INTERNET permission is present
+        hasInternetPermission = False
+        for el in tree.getroot():
+            if el.tag == "uses-permission" and ns + "name" in el.attrib:
+                if el.attrib[ns + "name"] == "android.permission.INTERNET":
+                    hasInternetPermission = True
+                    break
+        if not hasInternetPermission:
+            print("[+] Adding android.permission.INTERNET to AndroidManifest.xml")
+            usesPermissionEl = xml.etree.ElementTree.Element("uses-permission")
+            usesPermissionEl.attrib[ns + "name"] = "android.permission.INTERNET"
+            tree.getroot().insert(0, usesPermissionEl)
+        
+        # Set extractNativeLibs to true
+        appEl = tree.find(".//application")
+        if appEl is not None:
+            print("[+] \tSetting extractNativeLibs to true")
+            appEl.attrib[ns + "extractNativeLibs"] = "true"
+
+
+        if fix_network_security_config:
+            print("[+] \tEnabling support for user-installed CA certificates.")
+
+            # Add networkSecurityConfig
+            for el in tree.findall("application"):
+                el.attrib[ns + "networkSecurityConfig"] = "@xml/network_security_config"
+
+            # Create a network security config file
+            fh = open(os.path.join(apkdir, "res", "xml", "network_security_config.xml"), "wb")
+            fh.write("<?xml version=\"1.0\" encoding=\"utf-8\" ?><network-security-config><base-config><trust-anchors><certificates src=\"system\" /><certificates src=\"user\" /></trust-anchors></base-config></network-security-config>".encode("utf-8"))
+            fh.close()
+        
+        # Save the updated AndroidManifest.xml
+        tree.write(manifestPath, encoding="utf-8", xml_declaration=True)
+    
+        # Rebuild apk file
+        result = runApkTool(["b", apkdir])
+        if result["returncode"] != 0:
+            abort("Error: Failed to run 'apktool b " + apkdir + "'.\nRun with --debug-output for more information.")
+
+
+        # Move rebuilt APK back to original location
+        rebuilt_apk = os.path.join(apkdir, "dist", os.path.basename(apkfile))
+        if os.path.exists(rebuilt_apk):
+            shutil.move(rebuilt_apk, apkfile)
+        else:
+            abort("Error: Rebuilt APK not found.")
+
 ####################
 # Check that required dependencies are present:
 # -> Tools used
@@ -169,34 +238,38 @@ def getStdout():
 # Get apktool version
 ####################
 def getApktoolVersion():
-    commands = [["apktool", "version"], ["apktool", "-version"]]
-    
+    commands = [["version"], ["v"], ["-version"], ["-v"]]    
     for cmd in commands:
         try:
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-            output = proc.stdout.decode("utf-8").strip()
-            version_str = output.split("-")[0].strip()
+            result = runApkTool(cmd)
+
+            if result["returncode"] != 0:
+                continue
+            version_output = result["stdout"].strip().split("\n")[0].strip()
+            version_str = version_output.split("-")[0].strip()
             return parse_version(version_str)
-        except (Exception):
+        except Exception as e:
             continue
     raise Exception("Error: Failed to get apktool version.")
 
-####################
-# Wrapper to run apktool platform-independently, complete with a dirty hack to fix apktool's dirty hack.
-####################
 def runApkTool(params):
-    if os.name == "nt":
-        args = ["apktool.bat"]
-        args.extend(params)
-        
-        # apktool.bat has a dirty hack that execute "pause", so we need a dirty hack to kill the pause command...
-        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=getStdout())
-        proc.communicate(b"\r\n")
-        return proc
-    else:
-        args = ["apktool"]
-        args.extend(params)
-        return subprocess.run(args, stdout=getStdout())
+    exe = "apktool.bat" if os.name == "nt" else "apktool"
+    # Feed "\r\n" so apktool.bat's `pause` won’t block on Windows.
+    cp = subprocess.run(
+        [exe, *params],
+        input="\r\n",        # Should be harmless on linux
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    # Return a simple, uniform dict
+    return {
+        "returncode": cp.returncode,
+        "stdout": cp.stdout,
+        "stderr": cp.stderr,
+        "ok": (cp.returncode == 0),
+    }
+
 
 ####################
 # Fix private resources preventing builds (apktool wontfix: https://github.com/iBotPeaches/Apktool/issues/2761)
@@ -220,8 +293,8 @@ def build(baseapkdir):
     fixPrivateResources(baseapkdir)
 
     verbosePrint("[+] Rebuilding APK with apktool.")
-    ret = runApkTool(["b", baseapkdir])
-    if ret.returncode != 0:
+    result = runApkTool(["b", baseapkdir])
+    if result["returncode"] != 0:
         abort("Error: Failed to run 'apktool b " + baseapkdir + "'.\nRun with --debug-output for more information.")
 
 ####################
@@ -231,7 +304,7 @@ def build(baseapkdir):
 def signAndZipAlign(baseapkdir, baseapkfilename):
     # Zip align the new APK
     verbosePrint("[+] Zip aligning new APK.")
-    assertSubprocessSuccessfulRun(["zipalign", "-f", "4", os.path.join(baseapkdir, "dist", baseapkfilename),
+    assertSubprocessSuccessfulRun(["zipalign", "-f", "4", "-p", os.path.join(baseapkdir, "dist", baseapkfilename),
         os.path.join(baseapkdir, "dist", baseapkfilename[:-4] + "-aligned.apk")])
     shutil.move(os.path.join(baseapkdir, "dist", baseapkfilename[:-4] + "-aligned.apk"), os.path.join(baseapkdir, "dist", baseapkfilename))
 
@@ -266,22 +339,23 @@ def verifyPackageName(pkgname):
     if len(packages) == 1:
         return packages[0]
     else:
-        warningPrint("\n[!] Multiple matching packages installed, select the package to patch.\n")
+        warningPrint("[!] Multiple matching packages installed, select the package to patch.")
         choice = -1
         while choice == -1:
             for i in range(len(packages)):
                 print("[" + str(i + 1) + "] " + packages[i])
-            choice = input("Choice: ")
+            choice = input("\nChoice: ")
             if not choice.isnumeric() or int(choice) < 1 or int(choice) > len(packages):
-                print("Invalid choice.\n")
+                print("\nInvalid choice.\n")
                 choice = -1
+        print("")
         return packages[int(choice) - 1]
 
 ####################
 # Get the APK path(s) on the device for the given package name.
 ####################
 def getAPKPathsForPackage(pkgname, current_user = "0", users_to_try = None):
-    print(f"\n[+] Retrieving APK path(s) for package: {pkgname} for user {current_user}")
+    print(f"[+] Retrieving APK path(s) for package: {pkgname} for user {current_user}")
     paths = []
     proc = subprocess.run(["adb", "shell", "pm", "path", "--user", current_user, pkgname], stdout=subprocess.PIPE)
     if proc.returncode != 0:
@@ -317,7 +391,7 @@ def getAPKPathsForPackage(pkgname, current_user = "0", users_to_try = None):
 ####################
 def getTargetAPK(pkgname, apkpaths, tmppath, disableStylesHack, extract_only):
     # Pull the APKs from the device
-    print("")
+
     bar = Bar('[+] Pulling APK file(s) from device', max=len(apkpaths))
     verboseOutput = ""
 
@@ -325,7 +399,7 @@ def getTargetAPK(pkgname, apkpaths, tmppath, disableStylesHack, extract_only):
     for remotepath in apkpaths:
         baseapkname = remotepath.split('/')[-1]
         localapks.append(os.path.join(tmppath, pkgname + "-" + baseapkname))
-        verboseOutput += f"[+] Pulled: {pkgname}-{baseapkname}\n"
+        verboseOutput += f"[+] Pulled: {pkgname}-{baseapkname}"
         bar.next()
         # assertSubprocessSuccessfulRun(["adb", "pull", remotepath, localapks[-1]])
         assertSubprocessSuccessfulRun(["adb", "pull", remotepath, localapks[-1]] )
@@ -349,14 +423,13 @@ def verbosePrint(msg):
 # Combine app bundles/split APKs into a single APK for patching.
 ####################
 def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, extract_only):
-    warningPrint("\n[!] App bundle/split APK detected, rebuilding as a single APK.")
+    warningPrint("[!] App bundle/split APK detected, rebuilding as a single APK.")
     
     # Extract the individual APKs
     baseapkdir = os.path.join(tmppath, pkgname + "-base")
     baseapkfilename = pkgname + "-base.apk"
     splitapkpaths = []
 
-    print("")
     bar = Bar('[+] Disassembling split APKs', max=len(localapks))
     verboseOutput = ""
     
@@ -365,7 +438,7 @@ def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, extract_onl
         bar.next()
         apkdir = apkpath[:-4]
         ret = runApkTool(["d", apkpath, "-o", apkdir])
-        if ret.returncode != 0:
+        if ret["returncode"] != 0:
             abort("\nError: Failed to run 'apktool d " + apkpath + " -o " + apkdir + "'.\nRun with --debug-output for more information.")
         
         # Record the destination paths of all but the base APK
@@ -374,14 +447,14 @@ def combineSplitAPKs(pkgname, localapks, tmppath, disableStylesHack, extract_onl
         
         # Check for ProGuard/AndResGuard - this might b0rk decompile/recompile
         if detectProGuard(apkdir):
-            warningPrint("\n[!] WARNING: Detected ProGuard/AndResGuard, decompile/recompile may not succeed.\n")
+            warningPrint("[!] WARNING: Detected ProGuard/AndResGuard, decompile/recompile may not succeed.\n")
     
     bar.finish()
 
     verbosePrint(verboseOutput)
 
     # Walk the extracted APK directories and copy files and directories to the base APK
-    print("\n[+] Rebuilding as a single APK")
+    print("[+] Rebuilding as a single APK")
     copySplitApkFiles(baseapkdir, splitapkpaths)
     
     # Fix public resource identifiers
@@ -461,7 +534,7 @@ def fixPublicResourceIDs(baseapkdir, splitapkpaths):
     # Bail if the base APK does not have a public.xml
     if not os.path.exists(os.path.join(baseapkdir, "res", "values", "public.xml")):
         return
-    verbosePrint("\n[+] Found public.xml in the base APK, fixing resource identifiers across split APKs.")
+    verbosePrint("[+] Found public.xml in the base APK, fixing resource identifiers across split APKs.")
     
     # Mappings of resource IDs and names
     idToDummyName = {}
@@ -597,7 +670,7 @@ def hackRemoveDuplicateStyleEntries(baseapkdir):
     
     # Save the result if any duplicates were found and removed
     if len(dupes) > 0:
-        verbosePrint("\n[+] Found styles.xml in the base APK, checking for duplicate <style> -> <item> elements and removing.")
+        verbosePrint("[+] Found styles.xml in the base APK, checking for duplicate <style> -> <item> elements and removing.")
         warningPrint("[!] Warning: this is a complete hack and may impact the visuals of the app, disable with --disable-styles-hack.")
         tree.write(os.path.join(baseapkdir, "res", "values", "styles.xml"), encoding="utf-8", xml_declaration=True)
         print("[+] Removed " + str(len(dupes)) + " duplicate entries from styles.xml.")
@@ -661,44 +734,13 @@ def rawREReplace(path, pattern, replacement):
             contents = file.read()
         newContents = re.sub(pattern, replacement, contents)
         if (contents != newContents):
-            dbgPrint("\n[~] Patching " + path)
+            dbgPrint("[~] Patching " + path)
             with open(path, 'w') as file:
                 file.write(newContents)
     else:
         abort("\nError: Failed to find file at " + path + " for pattern replacement")
 
-####################
-# Patch an APK to enable support for user-installed CA certs (e.g. Burp Suite CA cert).
-####################
-def enableUserCerts(apkfile):
-    # Create a separate temp directory to work from
-    print("\n[+] Patching APK to enable support for user-installed CA certificates.")
-    with tempfile.TemporaryDirectory() as tmppath:
-        # Extract the APK
-        apkdir = os.path.join(tmppath, apkfile.split(os.sep)[-1][:-4])
-        apkname = apkdir.split(os.sep)[-1] + ".apk"
-        ret = runApkTool(["d", apkfile, "-o", apkdir])
-        if ret.returncode != 0:
-            abort("Error: Failed to run 'apktool d " + apkfile + " -o " + apkdir + "'.\nRun with --debug-output for more information.")
-        
-        # Load AndroidManifest.xml and check for or create the networkSecurityConfig attribute
-        tree = xml.etree.ElementTree.parse(os.path.join(apkdir, "AndroidManifest.xml"))
-        namespaces = dict([node for _,node in xml.etree.ElementTree.iterparse(os.path.join(apkdir, "AndroidManifest.xml"), events=["start-ns"])])
-        for ns in namespaces:
-            xml.etree.ElementTree.register_namespace(ns, namespaces[ns])
-        ns = "{" + namespaces["android"] + "}"
-        for el in tree.findall("application"):
-            el.attrib[ns + "networkSecurityConfig"] = "@xml/network_security_config"
-        tree.write(os.path.join(apkdir, "AndroidManifest.xml"), encoding="utf-8", xml_declaration=True)
-        
-        # Create a network security config file
-        fh = open(os.path.join(apkdir, "res", "xml", "network_security_config.xml"), "wb")
-        fh.write("<?xml version=\"1.0\" encoding=\"utf-8\" ?><network-security-config><base-config><trust-anchors><certificates src=\"system\" /><certificates src=\"user\" /></trust-anchors></base-config></network-security-config>".encode("utf-8"))
-        fh.close()
-        
-        # Rebuild and sign the APK
-        build(apkdir) # Fix https://github.com/NickstaDB/patch-apk/issues/30
-        signAndZipAlign(apkdir, apkname)
+
 
 ####################
 # Main
